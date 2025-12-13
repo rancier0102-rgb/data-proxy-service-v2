@@ -10,17 +10,21 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Configuración
 const config = {
 		PORT: process.env.PORT || 3000,
+		ALLOWED_DOMAINS: process.env.ALLOWED_DOMAINS ? process.env.ALLOWED_DOMAINS.split(',') : [],
 		DATA_FILE: process.env.DATA_FILE || 'data.json',
 		CACHE_TTL: 5 * 60 * 1000
 };
 
+// Logger simple
 const logger = {
 		info: (msg) => console.log(`[INFO] ${new Date().toISOString()} - ${msg}`),
 		error: (msg, err) => console.error(`[ERROR] ${new Date().toISOString()} - ${msg}`, err?.message || '')
 };
 
+// Middleware de seguridad
 app.use(compression());
 app.use(helmet({
 		contentSecurityPolicy: {
@@ -28,36 +32,49 @@ app.use(helmet({
 						defaultSrc: ["'self'"],
 						styleSrc: ["'self'", "'unsafe-inline'"],
 						scriptSrc: ["'self'", "'unsafe-inline'"],
-						imgSrc: ["'self'", "data:", "https:", "http:", "blob:"],
+						imgSrc: ["'self'", "data:", "https:", "http:"],
 						mediaSrc: ["'self'", "blob:", "data:", "https:", "http:"],
 						connectSrc: ["'self'", "https:", "http:"]
 				}
 		}
 }));
 
+// Rate limiting
 const videoProxyLimiter = rateLimit({
 		windowMs: 15 * 60 * 1000,
 		max: 100,
 		message: { status: 'error', message: 'Demasiadas solicitudes' }
 });
 
+// Variables globales
 let SERIES_LIST = [];
 let SERIES_INDEX = {};
 let TOTAL_EPISODES = 0;
 let DATA_LOADED = false;
 
+// Cargar datos
 function loadData() {
 		try {
 				const jsonPath = path.join(__dirname, config.DATA_FILE);
+				console.log('📂 Buscando archivo en:', jsonPath);
+
 				if (!fs.existsSync(jsonPath)) {
-						console.error('❌ NO EXISTE data.json');
+						console.error('❌ NO EXISTE el archivo data.json en:', jsonPath);
 						return;
 				}
 
+				console.log('✅ Archivo encontrado. Leyendo...');
 				const raw = fs.readFileSync(jsonPath, 'utf8');
-				const data = JSON.parse(raw);
+				console.log('📄 Tamaño del archivo:', raw.length, 'bytes');
 
-				if (!Array.isArray(data)) throw new Error('data.json debe ser un array');
+				const data = JSON.parse(raw);
+				console.log('✅ JSON parseado. Tipo de dato:', Array.isArray(data) ? 'Array' : typeof data);
+
+				if (!Array.isArray(data)) {
+						throw new Error('data.json debe ser un array');
+				}
+
+				console.log('📊 Número de episodios en el archivo:', data.length);
 
 				TOTAL_EPISODES = data.length;
 				logger.info(`${TOTAL_EPISODES} episodios encontrados`);
@@ -88,6 +105,7 @@ function loadData() {
 						map[name].count++;
 				});
 
+				// Ordenar episodios
 				Object.values(map).forEach(series => {
 						Object.keys(series.seasons).forEach(season => {
 								series.seasons[season].sort((a, b) => a.ep - b.ep);
@@ -109,16 +127,20 @@ function loadData() {
 
 		} catch (error) {
 				console.error('❌ Error en loadData:', error.message);
+				console.error(error.stack);
 		}
 }
 
+// Cargar datos inicialmente
 loadData();
 
+// Middleware CORS
 app.use((req, res, next) => {
 		res.setHeader('Access-Control-Allow-Origin', '*');
 		next();
 });
 
+// API Routes
 app.get('/api/stats', (req, res) => {
 		res.json({
 				status: 'ok',
@@ -128,23 +150,34 @@ app.get('/api/stats', (req, res) => {
 		});
 });
 
+// Endpoint de debug
+app.get('/api/debug', (req, res) => {
+		const jsonPath = path.join(__dirname, config.DATA_FILE);
+		if (!fs.existsSync(jsonPath)) {
+				return res.json({ error: 'File not found', path: jsonPath });
+		}
+		const raw = fs.readFileSync(jsonPath, 'utf8');
+		try {
+				const data = JSON.parse(raw);
+				res.json({
+						path: jsonPath,
+						fileExists: true,
+						length: data.length,
+						sample: data.slice(0, 2)
+				});
+		} catch (e) {
+				res.json({ error: 'Invalid JSON', message: e.message });
+		}
+});
+
 app.get('/api/series', (req, res) => {
 		const page = parseInt(req.query.page) || 0;
 		const limit = parseInt(req.query.limit) || 24;
 		const search = (req.query.q || '').toLowerCase();
-		const random = req.query.random === 'true';
 
-		let list = [...SERIES_LIST];
-
+		let list = SERIES_LIST;
 		if (search) {
 				list = list.filter(s => s.name.toLowerCase().includes(search));
-		}
-
-		if (random) {
-				for (let i = list.length - 1; i > 0; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[list[i], list[j]] = [list[j], list[i]];
-				}
 		}
 
 		const total = list.length;
@@ -167,6 +200,7 @@ app.get('/api/series/:name', (req, res) => {
 		res.json({ status: 'ok', data: series });
 });
 
+// Proxy de video
 app.get('/video-proxy', videoProxyLimiter, (req, res) => {
 		const url = req.query.url;
 		if (!url) return res.status(400).end();
@@ -210,455 +244,747 @@ app.get('/video-proxy', videoProxyLimiter, (req, res) => {
 						proxyRes.pipe(res);
 				});
 
-				proxyReq.on('error', () => res.status(502).end());
+				proxyReq.on('error', (error) => {
+						logger.error('Error en proxy:', error);
+						res.status(502).end();
+				});
+
 				proxyReq.end();
 
 		} catch (error) {
+				logger.error('Error procesando URL:', error);
 				res.status(400).end();
 		}
 });
 
+// HTML completo
 const HTML = `<!DOCTYPE html>
 <html lang="es">
 <head>
 		<meta charset="UTF-8">
-		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
 		<title>Stream Series</title>
 		<style>
-				*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-				:root{--primary:#e50914;--bg:#0a0a0a;--surface:#141414;--text:#fff;--text2:#888;--border:#222}
-				html,body{overscroll-behavior-y:contain;overflow:hidden;height:100%}
-				body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text)}
-				#app{height:100%;display:flex;flex-direction:column;overflow:hidden}
-
-				.header{padding:10px 12px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0}
-				.logo{font-size:16px;font-weight:bold;color:var(--primary)}
-				#search{flex:1;max-width:280px;padding:7px 12px;background:var(--bg);border:1px solid var(--border);border-radius:16px;color:var(--text);font-size:12px;outline:none}
-				#search:focus{border-color:var(--primary)}
-				.stats{font-size:10px;color:var(--text2);white-space:nowrap}
-
-				.pull-indicator{
-						position:absolute;top:0;left:0;right:0;height:0;
-						background:var(--surface);display:flex;align-items:center;justify-content:center;
-						overflow:hidden;transition:height .2s;z-index:50;border-bottom:1px solid var(--border);
+				* {
+						margin: 0;
+						padding: 0;
+						box-sizing: border-box;
+						-webkit-tap-highlight-color: transparent;
 				}
-				.pull-indicator.pulling{transition:none}
-				.pull-indicator.refreshing{height:50px}
-				.pull-icon{font-size:20px;transition:transform .2s}
-				.pull-indicator.refreshing .pull-icon{animation:spin .6s linear infinite}
-				.pull-text{font-size:11px;color:var(--text2);margin-left:8px}
 
-				.content-wrapper{flex:1;position:relative;overflow:hidden}
-				.content{height:100%;padding:12px;overflow-y:auto;-webkit-overflow-scrolling:touch}
-				.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(85px,1fr));gap:10px}
-				@media(min-width:500px){.grid{grid-template-columns:repeat(auto-fill,minmax(95px,1fr))}}
-				@media(min-width:800px){.grid{grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:12px}}
+				:root {
+						--primary: #e50914;
+						--background: #0a0a0a;
+						--surface: #141414;
+						--text: #ffffff;
+						--text-secondary: #b3b3b3;
+						--border: #2a2a2a;
+				}
 
-				.card{background:var(--surface);border-radius:5px;overflow:hidden;cursor:pointer;transition:transform .15s}
-				.card:hover{transform:scale(1.03)}
-				.card-img{position:relative;width:100%;padding-top:130%;background:var(--border);overflow:hidden}
-				.card-img canvas,.card-img img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
-				.card-img canvas{filter:blur(8px);transform:scale(1.1)}
-				.card-img img{opacity:0;transition:opacity .2s}
-				.card-img img.loaded{opacity:1}
-				.card-info{padding:6px}
-				.card-title{font-size:10px;font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.2}
-				.card-meta{font-size:8px;color:var(--text2);margin-top:2px}
+				body {
+						font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+						background: var(--background);
+						color: var(--text);
+						min-height: 100vh;
+				}
 
-				.detail{position:fixed;inset:0;background:var(--bg);z-index:1000;display:none;flex-direction:column}
-				.detail.active{display:flex}
-				.detail-header{padding:12px;display:flex;align-items:center;gap:10px;background:var(--surface);border-bottom:1px solid var(--border)}
-				.detail-title{flex:1;font-size:14px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-				.btn{background:rgba(255,255,255,.1);border:none;color:var(--text);width:32px;height:32px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px}
-				.btn:hover{background:rgba(255,255,255,.2)}
-				.seasons{padding:10px 12px;display:flex;gap:6px;overflow-x:auto;background:var(--surface)}
-				.season-btn{padding:5px 12px;background:var(--bg);border:1px solid var(--border);border-radius:14px;color:var(--text2);cursor:pointer;font-size:11px}
-				.season-btn.active{background:var(--primary);border-color:var(--primary);color:#fff}
-				.episodes{flex:1;overflow-y:auto;padding:12px}
-				.episode{background:var(--surface);border-radius:5px;padding:10px;margin-bottom:8px;cursor:pointer;display:flex;align-items:center;gap:10px}
-				.episode:hover{background:var(--border)}
-				.ep-num{background:var(--primary);color:#fff;min-width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:bold}
-				.ep-title{font-size:12px;font-weight:600}
-				.ep-meta{font-size:10px;color:var(--text2)}
+				#app {
+						min-height: 100vh;
+						display: flex;
+						flex-direction: column;
+				}
 
-				.player{position:fixed;inset:0;background:#000;z-index:2000;display:none;flex-direction:column}
-				.player.active{display:flex}
-				.player-header{padding:12px;position:absolute;top:0;left:0;right:0;z-index:10;background:linear-gradient(#000,transparent);display:flex;align-items:center;gap:10px}
-				.player-title{color:#fff;font-size:13px;flex:1}
-				.video-wrap{flex:1;display:flex;align-items:center;justify-content:center}
-				video{width:100%;height:100%}
+				.header {
+						padding: 16px;
+						background: var(--surface);
+						border-bottom: 1px solid var(--border);
+						display: flex;
+						align-items: center;
+						justify-content: space-between;
+						flex-wrap: wrap;
+						gap: 12px;
+						position: sticky;
+						top: 0;
+						z-index: 100;
+				}
 
-				.loading,.empty{text-align:center;padding:30px;color:var(--text2);font-size:12px}
-				.loading::after{content:'';display:block;width:20px;height:20px;margin:12px auto;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .6s linear infinite}
-				@keyframes spin{to{transform:rotate(360deg)}}
-				::-webkit-scrollbar{width:5px;height:5px}
-				::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+				.logo {
+						font-size: 20px;
+						font-weight: bold;
+						color: var(--primary);
+				}
+
+				#search {
+						flex: 1;
+						min-width: 200px;
+						max-width: 400px;
+						padding: 10px 16px;
+						background: var(--background);
+						border: 1px solid var(--border);
+						border-radius: 20px;
+						color: var(--text);
+						font-size: 14px;
+						outline: none;
+				}
+
+				#search:focus {
+						border-color: var(--primary);
+				}
+
+				.stats {
+						font-size: 12px;
+						color: var(--text-secondary);
+						white-space: nowrap;
+				}
+
+				.content {
+						flex: 1;
+						padding: 20px;
+						overflow-y: auto;
+				}
+
+				.grid {
+						display: grid;
+						grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+						gap: 16px;
+						padding-bottom: 20px;
+				}
+
+				@media (max-width: 768px) {
+						.grid {
+								grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+								gap: 12px;
+						}
+						.header {
+								padding: 12px;
+						}
+				}
+
+				@media (max-width: 480px) {
+						.grid {
+								grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+								gap: 10px;
+						}
+				}
+
+				.card {
+						background: var(--surface);
+						border-radius: 8px;
+						overflow: hidden;
+						cursor: pointer;
+						transition: transform 0.2s, box-shadow 0.2s;
+				}
+
+				.card:hover {
+						transform: translateY(-4px);
+						box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+				}
+
+				.card-poster {
+						width: 100%;
+						height: 200px;
+						object-fit: cover;
+						display: block;
+						background: var(--border);
+				}
+
+				.card-info {
+						padding: 12px;
+				}
+
+				.card-title {
+						font-size: 14px;
+						font-weight: 600;
+						margin-bottom: 4px;
+						display: -webkit-box;
+						-webkit-line-clamp: 2;
+						-webkit-box-orient: vertical;
+						overflow: hidden;
+				}
+
+				.card-meta {
+						font-size: 11px;
+						color: var(--text-secondary);
+				}
+
+				.detail {
+						position: fixed;
+						inset: 0;
+						background: var(--background);
+						z-index: 1000;
+						display: none;
+						flex-direction: column;
+						overflow: hidden;
+				}
+
+				.detail.active {
+						display: flex;
+				}
+
+				.detail-header {
+						padding: 16px 20px;
+						display: flex;
+						justify-content: space-between;
+						align-items: center;
+						background: var(--surface);
+						border-bottom: 1px solid var(--border);
+				}
+
+				.detail-title {
+						font-size: 18px;
+						font-weight: bold;
+						flex: 1;
+						margin: 0 16px;
+						white-space: nowrap;
+						overflow: hidden;
+						text-overflow: ellipsis;
+				}
+
+				.btn-back, .btn-close {
+						background: rgba(255,255,255,0.1);
+						border: none;
+						color: var(--text);
+						width: 40px;
+						height: 40px;
+						border-radius: 50%;
+						cursor: pointer;
+						display: flex;
+						align-items: center;
+						justify-content: center;
+						font-size: 18px;
+						transition: background 0.2s;
+				}
+
+				.btn-back:hover, .btn-close:hover {
+						background: rgba(255,255,255,0.2);
+				}
+
+				.seasons {
+						padding: 16px 20px;
+						display: flex;
+						gap: 8px;
+						overflow-x: auto;
+						background: var(--surface);
+						border-bottom: 1px solid var(--border);
+				}
+
+				.season-btn {
+						padding: 8px 16px;
+						background: var(--background);
+						border: 1px solid var(--border);
+						border-radius: 20px;
+						color: var(--text-secondary);
+						cursor: pointer;
+						white-space: nowrap;
+						transition: all 0.2s;
+				}
+
+				.season-btn:hover {
+						border-color: var(--text-secondary);
+				}
+
+				.season-btn.active {
+						background: var(--primary);
+						border-color: var(--primary);
+						color: white;
+				}
+
+				.episodes {
+						flex: 1;
+						overflow-y: auto;
+						padding: 20px;
+				}
+
+				.episode {
+						background: var(--surface);
+						border-radius: 8px;
+						padding: 16px;
+						margin-bottom: 12px;
+						cursor: pointer;
+						display: flex;
+						align-items: center;
+						gap: 12px;
+						transition: background 0.2s;
+				}
+
+				.episode:hover {
+						background: var(--border);
+				}
+
+				.episode-number {
+						background: var(--primary);
+						color: white;
+						min-width: 36px;
+						height: 36px;
+						border-radius: 50%;
+						display: flex;
+						align-items: center;
+						justify-content: center;
+						font-size: 13px;
+						font-weight: bold;
+				}
+
+				.episode-info {
+						flex: 1;
+						min-width: 0;
+				}
+
+				.episode-title {
+						font-size: 14px;
+						font-weight: 600;
+						margin-bottom: 4px;
+						white-space: nowrap;
+						overflow: hidden;
+						text-overflow: ellipsis;
+				}
+
+				.episode-meta {
+						font-size: 12px;
+						color: var(--text-secondary);
+				}
+
+				.player {
+						position: fixed;
+						inset: 0;
+						background: black;
+						z-index: 2000;
+						display: none;
+						flex-direction: column;
+				}
+
+				.player.active {
+						display: flex;
+				}
+
+				.player-header {
+						padding: 16px 20px;
+						display: flex;
+						justify-content: space-between;
+						align-items: center;
+						background: linear-gradient(to bottom, rgba(0,0,0,0.9), transparent);
+						position: absolute;
+						top: 0;
+						left: 0;
+						right: 0;
+						z-index: 10;
+				}
+
+				.player-title {
+						color: white;
+						font-size: 16px;
+						flex: 1;
+						margin-left: 16px;
+				}
+
+				.video-container {
+						flex: 1;
+						display: flex;
+						align-items: center;
+						justify-content: center;
+						background: black;
+				}
+
+				video {
+						width: 100%;
+						height: 100%;
+						max-height: 100vh;
+				}
+
+				.loading, .empty, .error {
+						text-align: center;
+						padding: 60px 20px;
+						color: var(--text-secondary);
+				}
+
+				.error {
+						color: var(--primary);
+				}
+
+				.loading::after {
+						content: '';
+						display: block;
+						width: 30px;
+						height: 30px;
+						margin: 20px auto;
+						border: 3px solid var(--border);
+						border-top-color: var(--primary);
+						border-radius: 50%;
+						animation: spin 1s linear infinite;
+				}
+
+				@keyframes spin {
+						to { transform: rotate(360deg); }
+				}
+
+				::-webkit-scrollbar {
+						width: 8px;
+						height: 8px;
+				}
+
+				::-webkit-scrollbar-track {
+						background: var(--background);
+				}
+
+				::-webkit-scrollbar-thumb {
+						background: var(--border);
+						border-radius: 4px;
+				}
+
+				::-webkit-scrollbar-thumb:hover {
+						background: var(--text-secondary);
+				}
 		</style>
 </head>
 <body>
-<div id="app">
-		<div class="header">
-				<div class="logo">STREAM+</div>
-				<input type="search" id="search" placeholder="Buscar...">
-				<div class="stats" id="stats">...</div>
-		</div>
-		<div class="content-wrapper">
-				<div class="pull-indicator" id="pullIndicator">
-						<span class="pull-icon">🎲</span>
-						<span class="pull-text">Suelta para mezclar</span>
+		<div id="app">
+				<div class="header">
+						<div class="logo">STREAM+</div>
+						<input type="search" id="search" placeholder="Buscar series...">
+						<div class="stats" id="stats">Cargando...</div>
 				</div>
+
 				<div class="content" id="content">
-						<div class="grid" id="grid"><div class="loading">Cargando...</div></div>
+						<div class="grid" id="grid">
+								<div class="loading">Cargando series...</div>
+						</div>
+				</div>
+
+				<div class="detail" id="detail">
+						<div class="detail-header">
+								<button class="btn-back" id="detail-back">←</button>
+								<div class="detail-title" id="detail-title"></div>
+								<button class="btn-close" id="detail-close">✕</button>
+						</div>
+						<div class="seasons" id="seasons"></div>
+						<div class="episodes" id="episodes"></div>
+				</div>
+
+				<div class="player" id="player">
+						<div class="player-header">
+								<button class="btn-close" id="player-close">✕</button>
+								<div class="player-title" id="player-title"></div>
+						</div>
+						<div class="video-container">
+								<video id="video" controls playsinline></video>
+						</div>
 				</div>
 		</div>
-		<div class="detail" id="detail">
-				<div class="detail-header">
-						<button class="btn" id="detailBack">←</button>
-						<div class="detail-title" id="detailTitle"></div>
-						<button class="btn" id="detailClose">✕</button>
-				</div>
-				<div class="seasons" id="seasons"></div>
-				<div class="episodes" id="episodes"></div>
-		</div>
-		<div class="player" id="player">
-				<div class="player-header">
-						<button class="btn" id="playerClose">✕</button>
-						<div class="player-title" id="playerTitle"></div>
-				</div>
-				<div class="video-wrap"><video id="video" controls playsinline></video></div>
-		</div>
-</div>
-<script>
-(function(){
-		'use strict';
 
-		const state = {series:[],page:0,hasMore:true,loading:false,search:'',random:true,currentSeries:null,currentSeason:null};
+		<script>
+				(function() {
+						'use strict';
 
-		let pullStartY = 0;
-		let pullMoveY = 0;
-		let isPulling = false;
-		let isRefreshing = false;
-		const PULL_THRESHOLD = 80;
+						// Estado
+						const state = {
+								series: [],
+								page: 0,
+								hasMore: true,
+								loading: false,
+								search: '',
+								currentSeries: null,
+								currentSeason: null
+						};
 
-		function createThumb(canvas, url) {
-				const ctx = canvas.getContext('2d');
-				const img = new Image();
-				img.crossOrigin = 'anonymous';
-				const size = 16;
-				canvas.width = size;
-				canvas.height = size * 1.4;
-				img.onload = function() { ctx.drawImage(img, 0, 0, size, size * 1.4); };
-				img.src = url;
-		}
-
-		let observer = null;
-		function initObserver() {
-				if (!('IntersectionObserver' in window)) return;
-				observer = new IntersectionObserver(function(entries) {
-						entries.forEach(function(entry) {
-								if (entry.isIntersecting) {
-										const card = entry.target;
-										const img = card.querySelector('img');
-										const src = img.dataset.src;
-										if (src) {
-												img.src = src;
-												img.onload = function() { img.classList.add('loaded'); };
-												img.onerror = function() { img.classList.add('loaded'); img.style.opacity = '0.3'; };
-										}
-										observer.unobserve(card);
-								}
-						});
-				}, { rootMargin: '200px', threshold: 0.01 });
-		}
-
-		function esc(s) { return s ? String(s).replace(/[<>"'&]/g, c => ({'<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','&':'&amp;'}[c])) : ''; }
-		function debounce(fn, ms) { let t; return function() { clearTimeout(t); t = setTimeout(() => fn.apply(this, arguments), ms); }; }
-		function fetchJSON(url) { return fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status)); }
-
-		// ========================================
-		// NAVEGACIÓN CON HISTORIAL (BACK BUTTON)
-		// ========================================
-		function pushState(view) {
-				history.pushState({ view: view }, '', '#' + view);
-		}
-
-		function handleBackButton() {
-				const player = document.getElementById('player');
-				const detail = document.getElementById('detail');
-				const video = document.getElementById('video');
-
-				// Prioridad: Player > Detail > Salir
-				if (player.classList.contains('active')) {
-						video.pause();
-						video.src = '';
-						player.classList.remove('active');
-						return true; // Manejado
-				}
-
-				if (detail.classList.contains('active')) {
-						detail.classList.remove('active');
-						state.currentSeries = null;
-						state.currentSeason = null;
-						return true; // Manejado
-				}
-
-				// Si estamos en la pantalla principal, permitir salir
-				return false;
-		}
-
-		// Escuchar evento popstate (botón back del navegador/app)
-		window.addEventListener('popstate', function(e) {
-				const handled = handleBackButton();
-				if (!handled) {
-						// Permitir navegación hacia atrás (salir al menú de la app)
-						// Media App Creator manejará esto
-				}
-		});
-
-		// Agregar estado inicial al historial
-		if (!location.hash) {
-				history.replaceState({ view: 'home' }, '', '#home');
-		}
-
-		document.addEventListener('DOMContentLoaded', function() {
-				initObserver();
-
-				const $ = id => document.getElementById(id);
-				const grid = $('grid'), content = $('content'), search = $('search'), stats = $('stats');
-				const detail = $('detail'), detailBack = $('detailBack'), detailClose = $('detailClose'), detailTitle = $('detailTitle');
-				const seasons = $('seasons'), episodes = $('episodes');
-				const player = $('player'), playerClose = $('playerClose'), playerTitle = $('playerTitle'), video = $('video');
-				const pullIndicator = $('pullIndicator');
-				const pullIcon = pullIndicator.querySelector('.pull-icon');
-				const pullText = pullIndicator.querySelector('.pull-text');
-
-				fetchJSON('/api/stats').then(d => { stats.textContent = d.series + ' series'; }).catch(() => {});
-
-				// Pull to refresh
-				function handleTouchStart(e) {
-						if (content.scrollTop <= 0 && !isRefreshing) {
-								pullStartY = e.touches[0].clientY;
-								isPulling = true;
-								pullIndicator.classList.add('pulling');
-						}
-				}
-
-				function handleTouchMove(e) {
-						if (!isPulling || isRefreshing) return;
-						pullMoveY = e.touches[0].clientY - pullStartY;
-						if (pullMoveY > 0 && content.scrollTop <= 0) {
-								e.preventDefault();
-								const resistance = 0.4;
-								const height = Math.min(pullMoveY * resistance, PULL_THRESHOLD + 20);
-								pullIndicator.style.height = height + 'px';
-								const rotation = Math.min((height / PULL_THRESHOLD) * 360, 360);
-								pullIcon.style.transform = 'rotate(' + rotation + 'deg)';
-								if (height >= PULL_THRESHOLD) {
-										pullText.textContent = '¡Suelta para mezclar!';
-										pullIcon.textContent = '🎲';
+						// Esperar a que el DOM esté listo
+						function ready(fn) {
+								if (document.readyState !== 'loading') {
+										fn();
 								} else {
-										pullText.textContent = 'Desliza para mezclar';
-										pullIcon.textContent = '↓';
+										document.addEventListener('DOMContentLoaded', fn);
 								}
 						}
-				}
 
-				function handleTouchEnd() {
-						if (!isPulling) return;
-						pullIndicator.classList.remove('pulling');
-						const pullDistance = parseFloat(pullIndicator.style.height) || 0;
-						if (pullDistance >= PULL_THRESHOLD && !isRefreshing) {
-								isRefreshing = true;
-								pullIndicator.classList.add('refreshing');
-								pullIndicator.style.height = '';
-								pullIcon.textContent = '🎲';
-								pullIcon.style.transform = '';
-								pullText.textContent = 'Mezclando...';
-								state.random = true;
-								state.search = '';
-								search.value = '';
-								load(false).finally(function() {
-										setTimeout(function() {
-												isRefreshing = false;
-												pullIndicator.classList.remove('refreshing');
-										}, 300);
+						// Utilidades
+						function escapeHTML(str) {
+								if (!str) return '';
+								return String(str).replace(/[&<>"']/g, function(m) {
+										return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
 								});
-						} else {
-								pullIndicator.style.height = '0';
-								pullIcon.style.transform = '';
 						}
-						isPulling = false;
-						pullStartY = 0;
-						pullMoveY = 0;
-				}
 
-				content.addEventListener('touchstart', handleTouchStart, { passive: true });
-				content.addEventListener('touchmove', handleTouchMove, { passive: false });
-				content.addEventListener('touchend', handleTouchEnd, { passive: true });
+						function debounce(func, wait) {
+								let timeout;
+								return function(...args) {
+										clearTimeout(timeout);
+										timeout = setTimeout(() => func.apply(this, args), wait);
+								};
+						}
 
-				// Cargar series
-				function load(append) {
-						if (state.loading || (append && !state.hasMore)) return Promise.resolve();
-						state.loading = true;
-						if (!append) { grid.innerHTML = '<div class="loading">Cargando...</div>'; state.page = 0; state.hasMore = true; }
+						// API
+						async function fetchJSON(url) {
+								const res = await fetch(url);
+								if (!res.ok) throw new Error('HTTP ' + res.status);
+								return res.json();
+						}
 
-						let url = '/api/series?page=' + state.page + '&limit=48&random=' + state.random;
-						if (state.search) url += '&q=' + encodeURIComponent(state.search);
+						// Inicializar
+						ready(function() {
+								console.log('🚀 Iniciando aplicación...');
 
-						return fetchJSON(url).then(function(data) {
-								if (!append) grid.innerHTML = '';
-								if (!data.data.length && !append) { grid.innerHTML = '<div class="empty">Sin resultados</div>'; return; }
+								// Obtener elementos
+								const grid = document.getElementById('grid');
+								const content = document.getElementById('content');
+								const search = document.getElementById('search');
+								const stats = document.getElementById('stats');
+								const detail = document.getElementById('detail');
+								const detailBack = document.getElementById('detail-back');
+								const detailClose = document.getElementById('detail-close');
+								const detailTitle = document.getElementById('detail-title');
+								const seasons = document.getElementById('seasons');
+								const episodes = document.getElementById('episodes');
+								const player = document.getElementById('player');
+								const playerClose = document.getElementById('player-close');
+								const playerTitle = document.getElementById('player-title');
+								const video = document.getElementById('video');
 
-								data.data.forEach(function(s) {
-										const card = document.createElement('div');
-										card.className = 'card';
-										let posterUrl = s.poster || '';
-										card.innerHTML = 
-												'<div class="card-img">' +
-														'<canvas></canvas>' +
-														'<img data-src="' + esc(posterUrl) + '" alt="">' +
-												'</div>' +
-												'<div class="card-info">' +
-														'<div class="card-title">' + esc(s.name) + '</div>' +
-														'<div class="card-meta">T' + s.seasons + ' · ' + s.count + '</div>' +
-												'</div>';
-										const canvas = card.querySelector('canvas');
-										if (posterUrl) createThumb(canvas, posterUrl);
-										if (observer) observer.observe(card);
-										card.onclick = function() { openDetail(s.name); };
-										grid.appendChild(card);
+								// Verificar elementos
+								if (!grid || !content) {
+										console.error('❌ Elementos esenciales no encontrados');
+										return;
+								}
+
+								console.log('✅ Elementos encontrados');
+
+								// Cargar stats
+								fetchJSON('/api/stats')
+										.then(function(data) {
+												console.log('📊 Stats:', data);
+												stats.textContent = data.series + ' series · ' + data.episodes.toLocaleString() + ' episodios';
+										})
+										.catch(function(err) {
+												console.error('Error stats:', err);
+												stats.textContent = 'Error cargando';
+										});
+
+								// Cargar series
+								function loadSeries(append) {
+										if (state.loading) return;
+										if (!append && !state.hasMore) return;
+
+										state.loading = true;
+
+										if (!append) {
+												grid.innerHTML = '<div class="loading">Cargando series...</div>';
+												state.page = 0;
+												state.hasMore = true;
+												state.series = [];
+										}
+
+										var url = '/api/series?page=' + state.page + '&limit=24';
+										if (state.search) {
+												url += '&q=' + encodeURIComponent(state.search);
+										}
+
+										fetchJSON(url)
+												.then(function(data) {
+														console.log('📺 Series cargadas:', data.data.length);
+
+														if (!append) {
+																grid.innerHTML = '';
+														}
+
+														if (data.data.length === 0 && !append) {
+																grid.innerHTML = '<div class="empty">No se encontraron series</div>';
+																return;
+														}
+
+														data.data.forEach(function(serie) {
+																var card = document.createElement('div');
+																card.className = 'card';
+																card.innerHTML = 
+																		'<img class="card-poster" src="' + escapeHTML(serie.poster || '') + '" alt="' + escapeHTML(serie.name) + '" onerror="this.style.opacity=0.3">' +
+																		'<div class="card-info">' +
+																				'<div class="card-title">' + escapeHTML(serie.name) + '</div>' +
+																				'<div class="card-meta">T' + serie.seasons + ' · ' + serie.count + ' eps</div>' +
+																		'</div>';
+
+																card.addEventListener('click', function() {
+																		openDetail(serie.name);
+																});
+
+																grid.appendChild(card);
+														});
+
+														state.series = state.series.concat(data.data);
+														state.page++;
+														state.hasMore = data.hasMore;
+												})
+												.catch(function(err) {
+														console.error('Error cargando series:', err);
+														if (!append) {
+																grid.innerHTML = '<div class="error">Error al cargar series</div>';
+														}
+												})
+												.finally(function() {
+														state.loading = false;
+												});
+								}
+
+								// Abrir detalle
+								function openDetail(name) {
+										console.log('📂 Abriendo:', name);
+										detailTitle.textContent = name;
+										detail.classList.add('active');
+										seasons.innerHTML = '<div class="loading">Cargando...</div>';
+										episodes.innerHTML = '';
+
+										fetchJSON('/api/series/' + encodeURIComponent(name))
+												.then(function(response) {
+														state.currentSeries = response.data;
+														var seasonKeys = Object.keys(state.currentSeries.seasons).sort(function(a,b) { return a - b; });
+														state.currentSeason = seasonKeys[0];
+
+														// Renderizar temporadas
+														seasons.innerHTML = '';
+														seasonKeys.forEach(function(season) {
+																var btn = document.createElement('button');
+																btn.className = 'season-btn' + (season === state.currentSeason ? ' active' : '');
+																btn.textContent = 'T' + season;
+																btn.addEventListener('click', function() {
+																		state.currentSeason = season;
+																		seasons.querySelectorAll('.season-btn').forEach(function(b) {
+																				b.classList.toggle('active', b.textContent === 'T' + season);
+																		});
+																		renderEpisodes();
+																});
+																seasons.appendChild(btn);
+														});
+
+														renderEpisodes();
+												})
+												.catch(function(err) {
+														console.error('Error:', err);
+														seasons.innerHTML = '<div class="error">Error al cargar</div>';
+												});
+								}
+
+								// Renderizar episodios
+								function renderEpisodes() {
+										var eps = state.currentSeries && state.currentSeries.seasons[state.currentSeason];
+										if (!eps || eps.length === 0) {
+												episodes.innerHTML = '<div class="empty">No hay episodios</div>';
+												return;
+										}
+
+										episodes.innerHTML = '';
+										eps.forEach(function(ep) {
+												var div = document.createElement('div');
+												div.className = 'episode';
+												div.innerHTML = 
+														'<div class="episode-number">' + ep.ep + '</div>' +
+														'<div class="episode-info">' +
+																'<div class="episode-title">' + escapeHTML(ep.title) + '</div>' +
+																'<div class="episode-meta">T' + state.currentSeason + ' E' + ep.ep + '</div>' +
+														'</div>';
+
+												div.addEventListener('click', function() {
+														if (ep.url) {
+																playVideo(ep);
+														}
+												});
+
+												episodes.appendChild(div);
+										});
+								}
+
+								// Reproducir video
+								function playVideo(ep) {
+										console.log('▶️ Reproduciendo:', ep.title);
+										var url = ep.url;
+										if (url.startsWith('http://')) {
+												url = '/video-proxy?url=' + encodeURIComponent(url);
+										}
+										video.src = url;
+										playerTitle.textContent = ep.title;
+										player.classList.add('active');
+										video.play().catch(function(e) { console.log('Autoplay blocked'); });
+								}
+
+								// Cerrar detalle
+								function closeDetail() {
+										detail.classList.remove('active');
+										state.currentSeries = null;
+										state.currentSeason = null;
+								}
+
+								// Cerrar player
+								function closePlayer() {
+										video.pause();
+										video.src = '';
+										player.classList.remove('active');
+								}
+
+								// Event listeners
+								detailBack.addEventListener('click', closeDetail);
+								detailClose.addEventListener('click', closeDetail);
+								playerClose.addEventListener('click', closePlayer);
+
+								search.addEventListener('input', debounce(function(e) {
+										state.search = e.target.value.trim();
+										loadSeries(false);
+								}, 300));
+
+								// Scroll infinito
+								content.addEventListener('scroll', function() {
+										if (state.loading || !state.hasMore) return;
+										var scrollTop = content.scrollTop;
+										var scrollHeight = content.scrollHeight;
+										var clientHeight = content.clientHeight;
+										if (scrollTop + clientHeight >= scrollHeight - 200) {
+												loadSeries(true);
+										}
 								});
-								state.page++;
-								state.hasMore = data.hasMore;
-						}).catch(function() {
-								if (!append) grid.innerHTML = '<div class="empty">Error</div>';
-						}).finally(function() {
-								state.loading = false;
+
+								// Tecla Escape
+								document.addEventListener('keydown', function(e) {
+										if (e.key === 'Escape') {
+												if (player.classList.contains('active')) {
+														closePlayer();
+												} else if (detail.classList.contains('active')) {
+														closeDetail();
+												}
+										}
+								});
+
+								// Cargar series iniciales
+								console.log('📡 Cargando series...');
+								loadSeries(false);
 						});
-				}
-
-				// Abrir detalle (con push al historial)
-				function openDetail(name) {
-						pushState('detail'); // Agregar al historial
-						detailTitle.textContent = name;
-						detail.classList.add('active');
-						seasons.innerHTML = '<div class="loading"></div>';
-						episodes.innerHTML = '';
-
-						fetchJSON('/api/series/' + encodeURIComponent(name)).then(function(r) {
-								state.currentSeries = r.data;
-								const keys = Object.keys(r.data.seasons).sort((a,b) => a-b);
-								state.currentSeason = keys[0];
-								seasons.innerHTML = '';
-								keys.forEach(function(k) {
-										const btn = document.createElement('button');
-										btn.className = 'season-btn' + (k === state.currentSeason ? ' active' : '');
-										btn.textContent = 'T' + k;
-										btn.onclick = function() {
-												state.currentSeason = k;
-												seasons.querySelectorAll('.season-btn').forEach(b => b.classList.toggle('active', b.textContent === 'T'+k));
-												renderEps();
-										};
-										seasons.appendChild(btn);
-								});
-								renderEps();
-						}).catch(function() { seasons.innerHTML = '<div class="empty">Error</div>'; });
-				}
-
-				function renderEps() {
-						const eps = state.currentSeries?.seasons[state.currentSeason] || [];
-						if (!eps.length) { episodes.innerHTML = '<div class="empty">Sin episodios</div>'; return; }
-						episodes.innerHTML = '';
-						eps.forEach(function(e) {
-								const div = document.createElement('div');
-								div.className = 'episode';
-								div.innerHTML = '<div class="ep-num">' + e.ep + '</div><div><div class="ep-title">' + esc(e.title) + '</div><div class="ep-meta">T' + state.currentSeason + ' E' + e.ep + '</div></div>';
-								div.onclick = function() { if (e.url) playVideo(e); };
-								episodes.appendChild(div);
-						});
-				}
-
-				// Reproducir video (con push al historial)
-				function playVideo(e) {
-						pushState('player'); // Agregar al historial
-						let url = e.url;
-						if (url.startsWith('http://')) url = '/video-proxy?url=' + encodeURIComponent(url);
-						video.src = url;
-						playerTitle.textContent = e.title;
-						player.classList.add('active');
-						video.play().catch(() => {});
-				}
-
-				function closeDetail() {
-						detail.classList.remove('active');
-						state.currentSeries = null;
-						state.currentSeason = null;
-						// Volver en historial si es necesario
-						if (location.hash === '#detail') {
-								history.back();
-						}
-				}
-
-				function closePlayer() {
-						video.pause();
-						video.src = '';
-						player.classList.remove('active');
-						// Volver en historial si es necesario
-						if (location.hash === '#player') {
-								history.back();
-						}
-				}
-
-				detailBack.onclick = function() { history.back(); };
-				detailClose.onclick = function() { history.back(); };
-				playerClose.onclick = function() { history.back(); };
-
-				search.oninput = debounce(function() {
-						state.search = search.value.trim();
-						state.random = !state.search;
-						load(false);
-				}, 300);
-
-				content.onscroll = function() {
-						if (content.scrollTop + content.clientHeight >= content.scrollHeight - 400) load(true);
-				};
-
-				// Tecla Escape (para desktop)
-				document.onkeydown = function(e) {
-						if (e.key === 'Escape') {
-								history.back();
-						}
-				};
-
-				// Cargar inicial
-				load(false);
-		});
-})();
-</script>
+				})();
+		</script>
 </body>
 </html>`;
 
+// Servir la página principal
 app.get('/', (req, res) => {
 		res.setHeader('Content-Type', 'text/html');
 		res.send(HTML);
 });
 
+// Health check
 app.get('/health', (req, res) => {
-		res.json({ status: 'ok', series: SERIES_LIST.length, episodes: TOTAL_EPISODES });
+		res.json({
+				status: 'ok',
+				uptime: process.uptime(),
+				series: SERIES_LIST.length,
+				episodes: TOTAL_EPISODES
+		});
 });
 
+// 404
 app.use((req, res) => {
-		res.status(404).json({ status: 'error', message: 'Not found' });
+		res.status(404).json({ status: 'error', message: 'Ruta no encontrada' });
 });
 
+// Iniciar servidor
 app.listen(PORT, '0.0.0.0', () => {
 		console.log('');
 		console.log('══════════════════════════════════════');
-		console.log('  🎬 STREAM SERIES');
-		console.log('  🔗 http://localhost:' + PORT);
-		console.log('  📊 ' + SERIES_LIST.length + ' series | ' + TOTAL_EPISODES + ' eps');
-		console.log('  🎲 Pull down to shuffle!');
-		console.log('  📱 Back button supported!');
+		console.log('  🎬 STREAM SERIES SERVER');
 		console.log('══════════════════════════════════════');
-});
+		console.log('  🔗 http://localhost:' + PORT);
+		console.log('  📊 Series: ' + SERIES_LIST.length);
+		console.log('  📺 Episodios: ' + TOTAL_EPISODES.toLocaleString());
+		console.log('  ✅ Datos cargados: ' + DATA_LOADED);
+		console.log('══════════════════════════════════════');
 });
